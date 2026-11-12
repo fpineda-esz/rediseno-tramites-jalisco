@@ -3,8 +3,8 @@ import re
 import time
 import datetime
 from io import BytesIO
-import requests
 from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright
 import streamlit as st
 from docx import Document
 from docx.shared import Pt, RGBColor
@@ -41,10 +41,10 @@ PROMPT_SKILL_2 = cargar_prompt("prompts/skill_2_arquitecto.md")
 PROMPT_SKILL_3 = cargar_prompt("prompts/skill_3_ingeniero.md")
 
 # ---------------------------------------------------------
-# MOTOR DE EXTRACCIÓN Y LIMPIEZA HTML
+# MOTOR DE EXTRACCIÓN DINÁMICA (PLAYWRIGHT + HTML)
 # ---------------------------------------------------------
 def limpiar_html(contenido_html):
-    """Elimina ruido estructural y extrae todo el texto útil de la ficha."""
+    """Elimina ruido estructural y extrae el texto renderizado."""
     soup = BeautifulSoup(contenido_html, 'html.parser')
 
     for etiqueta in soup(["script", "style", "nav", "footer", "header", "noscript"]):
@@ -52,17 +52,93 @@ def limpiar_html(contenido_html):
 
     return soup.get_text(separator='\n', strip=True)
 
+def combinar_instantaneas_pestanas(instantaneas):
+    """Une el contenido de distintas pestañas eliminando encabezados/pies duplicados."""
+    if not instantaneas:
+        return ""
+    if len(instantaneas) == 1:
+        return instantaneas[0]
+
+    base_lineas = instantaneas[0].split('\n')
+    resultado = [instantaneas[0]]
+
+    for snap in instantaneas[1:]:
+        lineas = snap.split('\n')
+        # Quitar prefijo idéntico (menú superior)
+        inicio = 0
+        while inicio < len(base_lineas) and inicio < len(lineas) and base_lineas[inicio] == lineas[inicio]:
+            inicio += 1
+        # Quitar sufijo idéntico (pie de página)
+        fin_base = len(base_lineas) - 1
+        fin_actual = len(lineas) - 1
+        while fin_base >= inicio and fin_actual >= inicio and base_lineas[fin_base] == lineas[fin_actual]:
+            fin_base -= 1
+            fin_actual -= 1
+
+        cuerpo_unico = "\n".join(lineas[inicio:fin_actual + 1]).strip()
+        if cuerpo_unico and cuerpo_unico not in resultado:
+            resultado.append(cuerpo_unico)
+
+    return "\n\n--- SECCIÓN DE FICHA ---\n\n".join(resultado)
+
 def extraer_texto_url(url):
+    """Renderiza la página SPA con Chromium y recorre todas sus pestañas internas."""
+    instantaneas = []
     try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            "Accept-Language": "es-MX,es;q=0.9"
-        }
-        respuesta = requests.get(url, headers=headers, timeout=20)
-        respuesta.raise_for_status()
-        return limpiar_html(respuesta.text)
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
+            )
+            context = browser.new_context(
+                user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                locale="es-MX"
+            )
+            page = context.new_page()
+            page.goto(url, wait_until="networkidle", timeout=45000)
+            page.wait_for_timeout(3000)
+
+            # Capturar vista inicial
+            texto_inicial = limpiar_html(page.content())
+            if texto_inicial:
+                instantaneas.append(texto_inicial)
+
+            # Detectar y recorrer pestañas o acordeones dinámicos del catálogo
+            selectores_tabs = '[role="tab"], .nav-tabs a, .nav-tabs button, .mat-mdc-tab, .mat-tab-label, [data-toggle="tab"], [data-bs-toggle="tab"]'
+            tabs = page.locator(selectores_tabs)
+            total_tabs = tabs.count()
+
+            for i in range(total_tabs):
+                try:
+                    tab = tabs.nth(i)
+                    if tab.is_visible():
+                        tab.click(timeout=3000)
+                        page.wait_for_timeout(1000)
+                        texto_tab = limpiar_html(page.content())
+                        if texto_tab:
+                            instantaneas.append(texto_tab)
+                except Exception:
+                    continue
+
+            # Expandir acordeones cerrados si existen
+            acordeones = page.locator('.accordion-button.collapsed, [data-bs-toggle="collapse"][aria-expanded="false"]')
+            for j in range(acordeones.count()):
+                try:
+                    acordeon = acordeones.nth(j)
+                    if acordeon.is_visible():
+                        acordeon.click(timeout=2000)
+                        page.wait_for_timeout(500)
+                except Exception:
+                    continue
+
+            if acordeones.count() > 0:
+                instantaneas.append(limpiar_html(page.content()))
+
+            browser.close()
+
+        return combinar_instantaneas_pestanas(instantaneas)
     except Exception as e:
-        st.error(f"Error al leer la URL del portal estatal: {e}")
+        st.error(f"Error al renderizar la URL del portal estatal: {e}")
         return None
 
 def extraer_texto_archivo_html(archivo_subido):
@@ -103,7 +179,6 @@ def consultar_gemini(system_instruction, texto_usuario):
 # UTILIDADES DE EXTRACCIÓN Y FORMATEO PARA WORD (.docx)
 # ---------------------------------------------------------
 def extraer_nombre_tramite(texto_fase_1):
-    """Extrae el nombre oficial del trámite o servicio desde la salida de la Fase 1."""
     patrones = [
         r'\*\*Nombre Oficial del Trámite:\*\*\s*(.+)',
         r'\*\*Nombre del Trámite:\*\*\s*(.+)',
@@ -119,7 +194,6 @@ def extraer_nombre_tramite(texto_fase_1):
     return "Trámite o Servicio Estatal"
 
 def agregar_texto_formateado(paragraph, texto):
-    """Convierte **negritas** y `código inline` a formato nativo de Word."""
     tokens = re.split(r'(\*\*.*?\*\*|`.*?`)', texto)
     for token in tokens:
         if not token:
@@ -135,7 +209,6 @@ def agregar_texto_formateado(paragraph, texto):
             paragraph.add_run(token)
 
 def renderizar_tabla_markdown(doc, lineas_tabla):
-    """Convierte bloques de tabla Markdown (| a | b |) en tablas reales de Word."""
     filas_limpias = []
     for linea in lineas_tabla:
         celdas = [c.strip() for c in linea.strip().strip('|').split('|')]
@@ -170,15 +243,20 @@ def renderizar_tabla_markdown(doc, lineas_tabla):
     doc.add_paragraph()
 
 def insertar_bloque_uml(doc, codigo_uml):
-    """Inserta el código PlantUML limpio y aislado para evitar fugas de estilo."""
+    """Inserta el código PlantUML preservando saltos de línea explícitos."""
     p = doc.add_paragraph()
     p.paragraph_format.left_indent = Pt(12)
     p.paragraph_format.space_before = Pt(6)
     p.paragraph_format.space_after = Pt(6)
-    run = p.add_run(codigo_uml.strip())
-    run.font.name = 'Courier New'
-    run.font.size = Pt(8.5)
-    run.font.color.rgb = RGBColor(30, 30, 30)
+
+    lineas_uml = codigo_uml.strip().split('\n')
+    for idx, linea_uml in enumerate(lineas_uml):
+        run = p.add_run(linea_uml)
+        run.font.name = 'Courier New'
+        run.font.size = Pt(8.5)
+        run.font.color.rgb = RGBColor(30, 30, 30)
+        if idx < len(lineas_uml) - 1:
+            run.add_break()
 
 def crear_documento_word(texto, nombre_tramite):
     doc = Document()
@@ -305,7 +383,7 @@ st.subheader("Rediseño y Digitalización de Trámites y Servicios (Gobierno del
 
 modo = st.radio(
     "Selecciona la fuente de la Ficha Informativa:",
-    ("URL directa del Catálogo Jalisco", "Subir archivo HTML de la Ficha (Respaldo si tiene pestañas dinámicas)")
+    ("URL directa del Catálogo Jalisco", "Subir archivo HTML guardado de la Ficha")
 )
 
 texto_crudo = None
@@ -318,7 +396,7 @@ if modo == "URL directa del Catálogo Jalisco":
         placeholder="[https://tramites.jalisco.gob.mx/catalogo.jalisco/](https://tramites.jalisco.gob.mx/catalogo.jalisco/)..."
     )
 else:
-    st.caption("💡 Si la página carga pestañas con JavaScript y la URL directa extrae texto incompleto, abre la ficha en tu navegador, presiona **Cmd + S** (o Ctrl + S), guárdala como **HTML** y súbela aquí.")
+    st.caption("💡 En Chrome/Edge, guarda la página como **'Página web, completa'** para conservar el contenido renderizado por JavaScript.")
     archivo_html = st.file_uploader("Arrastra aquí el archivo .html guardado", type=["html", "htm"])
 
 if st.button("Ejecutar Arquitectura Multi-Agente", type="primary"):
@@ -326,7 +404,7 @@ if st.button("Ejecutar Arquitectura Multi-Agente", type="primary"):
         if not url_input or not url_input.startswith("http"):
             st.warning("⚠️ Por favor, ingresa una URL válida que inicie con http:// o https://")
             st.stop()
-        with st.spinner("Extrayendo información del Catálogo Estatal de Jalisco..."):
+        with st.spinner("Abriendo ficha en navegador headless y recorriendo pestañas..."):
             texto_crudo = extraer_texto_url(url_input)
     else:
         if not archivo_html:
@@ -334,10 +412,10 @@ if st.button("Ejecutar Arquitectura Multi-Agente", type="primary"):
             st.stop()
         texto_crudo = extraer_texto_archivo_html(archivo_html)
 
-    if not texto_crudo or len(texto_crudo.strip()) < 100:
-        st.warning("⚠️ No se pudo extraer contenido suficiente. Si la página carga contenido dinámico con JavaScript, prueba usando la opción de subir el archivo HTML.")
+    if not texto_crudo or len(texto_crudo.strip()) < 150:
+        st.error("⚠️ No se pudo extraer contenido suficiente de la ficha. Verifica que la URL esté activa.")
     else:
-        with st.expander("👀 Ver texto extraído de la Ficha (Debug)"):
+        with st.expander("👀 Ver texto extraído completo de todas las pestañas (Debug)"):
             st.text(texto_crudo)
 
         progreso = st.progress(0)
@@ -369,7 +447,7 @@ if st.button("Ejecutar Arquitectura Multi-Agente", type="primary"):
 
                         documento_final = f"{res_fase_1}\n\n{res_fase_2}\n\n{res_fase_3}"
                         archivo_word = crear_documento_word(documento_final, nombre_tramite)
-                        nombre_archivo = re.sub(r'[^\w\s-]', '', nombre_tramite).strip().replace(' ', '_')
+                        nombre_archivo = re.sub(r'[^\w\s-]', '', nombre_tramite).strip().replace(' ', '_')[:60]
 
                         st.success(f"✅ Ficha Técnica generada para: **{nombre_tramite}**")
                         st.download_button(
